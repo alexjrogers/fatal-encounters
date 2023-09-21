@@ -1,0 +1,199 @@
+---
+title: "data-cleaning"
+format: html
+editor:
+  mode: source
+---
+
+This is my first attempt at approaching this project as a collection of several files that will be rendered together, as opposed to a single working document. This will be my document for cleaning the Fatal Encounters race data and geodata.
+
+```{r loading-libraries, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(tidycensus)
+library(tidygeocoder)
+library(tigris)
+library(sf)
+library(mapview)
+library(tmap)
+library(purrr)
+library(png)
+library(knitr)
+library(modelsummary)
+library(corrr)
+library(tinytex)
+library(janitor)
+library(viridis)
+library(leafpop)
+library(leaflet)
+library(magick)
+
+
+knit_hooks$set(crop = knitr::hook_pdfcrop)
+options(tigris_use_cache = TRUE)
+```
+
+
+# importing and initial wrangling
+```{r initial-wrangling-FE-data}
+
+## importing raw FE data
+tmp_d <- read.csv("FE.csv")
+
+## removing placeholder row and selecting necessary FE variables
+tmp_d <- tmp_d %>% subset(Location.of.injury..address. != "This row is a spacer for Fatal Encounters use.") %>% 
+select(
+  Unique.ID,
+  Age,
+  Gender,
+  Race,
+  Race.with.imputations,
+  Location.of.injury..address.,  
+  Location.of.death..city.,
+  State,
+  Location.of.death..zip.code.,
+  Location.of.death..county.,
+  Full.Address,
+  Latitude,
+  Longitude,
+  Agency.or.agencies.involved,
+  Highest.level.of.force,
+  Date.of.injury.resulting.in.death..month.day.year.)
+
+## renaming variables
+tmp_d <- tmp_d %>% rename(ID = Unique.ID,
+                    Location = Location.of.injury..address.,
+                    City = Location.of.death..city.,
+                    ZipCode = Location.of.death..zip.code.,
+                    County = Location.of.death..county.,
+                    Address = Full.Address,
+                    Agency = Agency.or.agencies.involved,
+                    ForceType = Highest.level.of.force,
+                    RaceImputed = Race.with.imputations,
+                    Date = Date.of.injury.resulting.in.death..month.day.year.)
+
+## reformatting date to ymd and adding year column
+tmp_d <- tmp_d %>% mutate(Date = mdy(Date), Year = year(Date))
+
+## removing corrupted entry which includes comma, ID 28891, report to FE team
+tmp_d <- tmp_d %>% filter(ID != "28891")
+
+## preserving unfiltered FE dataframe
+tmp_d_all <- tmp_d
+```
+
+```{r filtering-FE-forcetpye-race}
+
+## selecting desired years, 2010 - 2019
+tmp_d <- tmp_d %>% filter(Year >=2010 & Year <= 2019)
+
+## filtering events with no race data
+tmp_d <- tmp_d %>% filter(Race != "Race unspecified" | RaceImputed != "Race unspecified") %>% filter(!is.na(RaceImputed))
+
+## creating string of relevant force types
+types <- c("Gunshot", "Tasered", "Asphyxiated/Restrained", "Chemical agent/Pepper spray", "Beaten/Bludgeoned with instrument", "Restrain/Asphyxiation")
+
+## filtering events by relevant force type
+tmp_d <- tmp_d %>% filter(grepl(paste(types, collapse = "|"), ForceType))
+
+```
+
+Now that I have the DF filtered by years, with NA race values excluded, and by relevant force type, I create my sf object by converting the coordinates to points. I know there are some bad geodata in this dataset, so the next step is to get that cleaned up.
+
+# repairing bad geodata, step one
+
+First I will create an SF object with point data for each event by converting the coordinates into points.
+```{r converting-coords-to-points}
+
+tmp_dpoints <- tmp_d %>% st_as_sf(coords = c("Longitude", "Latitude"), crs = "NAD83", remove = FALSE)
+## here remove = FALSE retains the coordinates when converting them to points
+
+```
+
+The process for identifying and fixing bad records is as follows:
+I will link each FE event with its expected state in the US Census data. That is, match the state variable in FE (e.g. "CA") to the STUSPS (the state code per USPS data) variable in the Census data (e.g. "CA").
+
+To do this, I will import state-level Census data, then split that data so each state has its own SF object. 
+Similarly with the FE data, I will split events by state, creating one SF object for each state, with all the fatal encounters for that state inside.
+
+Then I will join the each split Census state object to its partner FE state object. Each object will be joined by the state identifier variable (State for FE, STUSPS for Census).
+
+Events whose coordinates are outside of the state they were reported in will not be able to generate a GEOID becasue (EXPLAIN??), so they will generate NA values. This will be how I can identify the records with bad geodata.
+
+Let's get started:
+
+Creating the list of SF Objects, one for each state.
+```{r}
+
+tmp_dpoints_split <- split(tmp_dpoints, tmp_dpoints$State)
+
+
+```
+
+Now I can import the Census state data to split and link with the the corresponding FE state objects.
+```{r}
+
+## creating string of race variables to pull from the Census
+racecats <- c(Hispanic = "P2_002N", White = "P2_005N", Black = "P2_006N", Native = "P2_007N", Asian  = "P2_008N")
+
+## importing state-level Census data
+states <- get_decennial(year = 2020,
+                        geography = "state",
+                        geometry = TRUE,
+                        sumfile = "pl",
+                        variables = racecats,
+                        cache_table = TRUE,
+                        summary_var = "P2_001N",
+                        output = "wide",
+                        keep_geo_vars = TRUE)
+
+## filtering out Puerto Rico
+states <- states %>% filter(GEOID != "72")
+
+## creating race percent variables
+states <- states %>% mutate(pct_blk = Black / summary_value * 100,
+                            pct_white = White / summary_value * 100,
+                            pct_hispanic = Hispanic / summary_value * 100,
+                            pct_asian = Asian / summary_value * 100,
+                            pct_native = Native / summary_value * 100)
+
+## creating majority race variables
+states <- states %>% mutate(maj_white = if_else(pct_white > pct_blk & pct_white > pct_hispanic & pct_white > pct_asian & pct_white > pct_native, "yes", "no"),
+                            maj_blk = if_else(pct_blk > pct_white & pct_blk > pct_hispanic & pct_blk > pct_asian & pct_blk > pct_native, "yes", "no"),
+                            maj_hisp = if_else(pct_hispanic > pct_white & pct_hispanic > pct_blk & pct_hispanic > pct_asian & pct_hispanic > pct_native, "yes", "no"),
+                            maj_asian = if_else(pct_asian > pct_white & pct_asian > pct_blk & pct_asian > pct_hispanic & pct_asian > pct_native, "yes", "no"))
+
+## sorting the states by alphabetical order by state
+states <- states %>% arrange(STUSPS)
+```
+
+Note that there are no majority Native or Indigenous states, so we do not need to make a maj_native variable.
+
+With the state-level Census data imported and sorted, I can split each Census state into its own SF object to match with its partner FE state object.
+
+```{r splitting-census-states}
+
+## splitting the Census state object into a list of objects, one for each state
+states_split <- split(states, states$STUSPS)
+
+
+```
+
+With the list of Census SF object for each state, I can join each FE object with its partner Census object by state identifier.
+
+```{r}
+
+## creating a string of state abbreviations from FE data, then sorting alphabetically
+state_letters <- unique(tmp_dpoints$State) %>%  str_sort()
+
+## creating a list of joined Census and FE objects, one for each state
+tmp_dpoints_joined <- map2(tmp_dpoints_split[state_letters], states_split, st_join)
+
+
+```
+
+
+This join attempts to place each event within its corresponding state and generate the spatial and demographic information for that state. FE events with incorrect state classifications cannot be placed within the Census boundaries that the Census object expects, so they will generate NA values for all Census variables.
+
+With this done, we can filter events by those which have generated an NA value for GEOID (the Census geographic identifier), to identify the events with coordinate data in the FE dataset.
+
