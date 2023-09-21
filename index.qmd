@@ -1,0 +1,10 @@
+---
+title: "Welcome to My Homepage"
+format: html
+---
+
+This is the first website I made in Quarto and QRstudio.
+
+```{r}
+3 + 7
+```

@@ -1,0 +1,12 @@
+
+
+- What is my rate of missing race data per year? Edwards et al. restricted 2013 to 2018 because of the quality of the FE race data and missing race values. That paper was published four years ago in 2019. Is the race data in FE sufficiently improved enough now to justify 2010 - 2019?
+  They also imputed missing race values, which if they could do I can (and probably should) do. That can be considered after tallying missing race values and comparing my percentages with theirs (in their appendix)
+  From that appendix: "In conversation with the authors, Fatal Encounters indicated that missing race/ethnicity 100 data for 2018 and 2019 should be reduced once researchers conduct obituary searches for cases occurring in these years." - this indicates that there is a chance that the race data has improved since they did this work.
+  
+  
+From Edwards et al. appendix: "“Future researchers may consider conducting a systematic audit of FE 135 race/ethnicity coding to evaluate the interrater reliability of FE coding decisions for race / ethnicity.”
+  - this may be something interesting to consider
+  
+  “Our approach to missing data seeks to accurately describe uncertainty in mortality estimates by directly accounting for 143 error driven by missing data, as well as providing rate estimates that are not negatively biased through the list-wise deletion of 144 cases missing data on particular variables.”
+  - this is important, and is related to how I might want to be thinking about this as well.

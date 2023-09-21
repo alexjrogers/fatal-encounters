@@ -1,0 +1,23 @@
+project:
+  type: website
+
+website:
+  title: "A Website I Made"
+  navbar:
+    left:
+      - href: index.qmd
+        text: Home
+      - about.qmd
+      - href: maps.qmd
+        text: Some Maps
+      - href: clean.qmd
+        text: An attempt at a clean data doc
+        
+format:
+  html:
+    theme: cosmo
+    css: styles.css
+    toc: true
+
+editor: visual
+

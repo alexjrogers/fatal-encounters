@@ -1,0 +1,4 @@
+- source: project
+  netlify:
+    - id: 5323ac70-2110-4ee2-960a-573195e0b728
+      url: 'https://neon-dolphin-8c0292.netlify.app'

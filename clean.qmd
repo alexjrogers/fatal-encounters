@@ -1,0 +1,915 @@
+---
+title: "clean"
+format: html
+editor:
+  mode: source
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loading libraries, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(tidycensus)
+library(tidygeocoder)
+library(tigris)
+library(sf)
+library(mapview)
+library(tmap)
+library(purrr)
+library(png)
+library(knitr)
+library(modelsummary)
+library(corrr)
+library(tinytex)
+library(janitor)
+library(viridis)
+library(leafpop)
+library(leaflet)
+library(magick)
+
+
+knit_hooks$set(crop = knitr::hook_pdfcrop)
+options(tigris_use_cache = TRUE)
+```
+
+# Import, Wrangling, Variable Creation
+
+## Importing and wrangling Census data
+
+### State-level
+
+First I will make a character string of race variables. These are non-Hispanic one-race population numbers, as well as all Hispanic population numbers.
+
+```{r}
+
+racecats <- c(Hispanic = "P2_002N", White = "P2_005N", Black = "P2_006N", Native = "P2_007N", Asian  = "P2_008N")
+```
+
+Next I will get state-level geodata and populations by race.
+
+```{r}
+
+states <- get_decennial(year = 2020,
+                             geography = "state",
+                             geometry = TRUE,
+                             sumfile = "pl",
+                             variables = racecats,
+                             cache_table = TRUE,
+                             summary_var = "P2_001N",
+                             output = "wide",
+                        keep_geo_vars = TRUE)
+
+## filtering out Puerto Rico
+states <- states %>% filter(GEOID != "72")
+
+## creating race percent variables
+states <- states %>% mutate(pct_blk = Black / summary_value * 100,
+                            pct_white = White / summary_value * 100,
+                            pct_hispanic = Hispanic / summary_value * 100,
+                            pct_asian = Asian / summary_value * 100,
+                            pct_native = Native / summary_value * 100) %>% 
+  mutate(maj_white = if_else(pct_white > pct_blk & pct_white > pct_hispanic & pct_white > pct_asian & pct_white > pct_native, "yes", "no"),
+         maj_blk = if_else(pct_blk > pct_white & pct_blk > pct_hispanic & pct_blk > pct_asian & pct_blk > pct_native, "yes", "no"),
+         maj_hisp = if_else(pct_hispanic > pct_white & pct_hispanic > pct_blk & pct_hispanic > pct_asian & pct_hispanic > pct_native, "yes", "no"),
+         maj_asian = if_else(pct_asian > pct_white & pct_asian > pct_blk & pct_asian > pct_hispanic & pct_asian > pct_native, "yes", "no"))
+
+states <- states %>% arrange(STUSPS)
+
+
+```
+
+Next I will use tidy states data (long) to construct a variable which gives the majority race by population of each state, and that race's population percentage.
+
+```{r}
+
+states_tidy <- get_decennial(year = 2020,
+                             geography = "state",
+                             geometry = TRUE,
+                             sumfile = "pl",
+                             variables = racecats,
+                             cache_table = TRUE,
+                             summary_var = "P2_001N")
+
+## filtering out Puerto Rico
+states_tidy <- states_tidy %>% filter(GEOID != "72")
+
+## creating race percents for tidy data
+states_tidy <- states_tidy %>% mutate(pct = value / summary_value * 100)
+
+## creating dataframe with majority races for each state. I think I could mutate this directly into the wide data, but going one step at a time
+states_maj <- states_tidy %>% group_by(GEOID) %>% filter(pct == max(pct)) %>% rename(maj_race = variable,
+                                                                                     maj_pct = pct)
+```
+
+
+## cleaning and backing up all FE data, unfiltered
+
+```{r}
+
+# importing raw FE data
+tmp_d <- read.csv("FE.csv")
+
+# removing placeholder row and selecting necessary FE variables
+tmp_d <- tmp_d %>% subset(Location.of.injury..address. != "This row is a spacer for Fatal Encounters use.") %>% 
+select(
+  Unique.ID,
+  Age,
+  Gender,
+  Race,
+  Race.with.imputations,
+  Location.of.injury..address.,  
+  Location.of.death..city.,
+  State,
+  Location.of.death..zip.code.,
+  Location.of.death..county.,
+  Full.Address,
+  Latitude,
+  Longitude,
+  Agency.or.agencies.involved,
+  Highest.level.of.force,
+  Date.of.injury.resulting.in.death..month.day.year.)
+
+# renaming variables
+tmp_d <- tmp_d %>% rename(ID = Unique.ID,
+                    Location = Location.of.injury..address.,
+                    City = Location.of.death..city.,
+                    ZipCode = Location.of.death..zip.code.,
+                    County = Location.of.death..county.,
+                    Address = Full.Address,
+                    Agency = Agency.or.agencies.involved,
+                    ForceType = Highest.level.of.force,
+                    RaceImputed = Race.with.imputations,
+                    Date = Date.of.injury.resulting.in.death..month.day.year.)
+
+# reformatting date
+tmp_d <- tmp_d %>% mutate(Date = mdy(Date), Year = year(Date))
+
+## removing corrupted entry which includes comma, ID 28891, report to FE
+tmp_d <- tmp_d %>% filter(ID != "28891")
+
+## preserving unfiltered FE dataframe
+tmp_d_all <- tmp_d
+```
+
+## filtering FE data for years and Force Type
+```{r}
+
+## extracting desired years, 2010 - 2019
+tmp_d <- tmp_d %>% filter(Year >= 2010 & Year <= 2019)
+
+```
+
+```{r}
+
+## filtering events with no race data
+tmp_d <- tmp_d %>% filter(Race != "Race unspecified" | RaceImputed != "Race unspecified") %>% filter(!is.na(RaceImputed))
+
+## filtering by force types
+types <- c("Gunshot", "Tasered", "Asphyxiated/Restrained", "Chemical agent/Pepper spray", "Beaten/Bludgeoned with instrument", "Restrain/Asphyxiation")
+tmp_d <- tmp_d %>% filter(grepl(paste(types, collapse = "|"), ForceType))
+
+```
+
+Now that I have the DF filtered by years, with NA race values excluded, and by relevant force types, I create my sf object by converting the coordinates to points. I know there are some bad geodata in this dataset, so the next step is to get that cleaned up.
+
+## repairing bad geodata
+
+First I will create an SF object with point data for each event by converting the coordinates into points.
+```{r}
+
+tmp_dpoints <- tmp_d %>% st_as_sf(coords = c("Longitude", "Latitude"), crs = "NAD83", remove = FALSE)
+
+
+```
+
+Now I want to make a list of SF objects, one SF for each state.
+
+```{r}
+
+
+tmp_dpoints_split <- split(tmp_dpoints, tmp_dpoints$State)
+
+```
+
+Next I can use US Census states data and link each event with its expected state. Events with bad point data will link to the character values of the state, but will not be able to generate a GEOID because the coordinates will be outside the Census boundaries. So records with NA values for GEOID will represent the FE events with bad coordinate data.
+
+First I will split the states Census SF object into a list of SF objects, then I can pair the events with their states, generating NA values for incorrect coordinates.
+
+```{r}
+
+states_split <- split(states, states$STUSPS)
+
+
+```
+
+Now I will pair each event in tmp_dpoints_split (the FE data with coordinates converted to points) with the Census state level data.
+
+```{r}
+
+## creating a character string of state abbreviations from FE data
+state_letters <- unique(tmp_dpoints$State) %>% str_sort()
+
+## creating a merged list of SF objects, where each FE point is linked to the State-level Census geodata (and the other Census variables)
+tmp_dpoints_joined <- map2(tmp_dpoints_split[state_letters], states_split, st_join)
+
+```
+
+Filtering the list of merged SF objects so only the ones with NA values for GEOID remain.
+
+```{r}
+
+tmp_dpoints_joined_bad <- map(tmp_dpoints_joined, ~filter(.x, is.na(GEOID)))
+
+## dropping states which don't have bad records for simplicity in the next few steps
+tmp_dpoints_joined_bad <- tmp_dpoints_joined_bad %>% discard(~nrow(.) == 0)
+
+```
+
+Okay. This next part takes a couple steps, but it is an important check.
+
+In order to know what state these events actually occurred in, I'll need to:
+(1) Convert this list to a data frame, then to an SF Object.
+(2) Join the SF object to the states Census SF object.
+
+This will allow each point to populate its correct GEOID and state name, while also retaining the incorrect state name (this part is mostly so I can report the bad records to the Fatal Encounters team).
+
+```{r}
+
+## transforming the list of SF objects to a single DF
+tmp_dpoints_joined_bad_df <- list_rbind(tmp_dpoints_joined_bad)
+
+## converting the new DF to an SF object
+tmp_dpoints_joined_bad_sf <- tmp_dpoints_joined_bad_df %>% st_as_sf(crs = "NAD83", remove = FALSE)
+
+## Creating SF pip object with bad points and US Census data
+## I could probably do this bind more cleanly above so that there aren't STUSPS.x STUSPS.y etc.
+tmp_dpoints_joined_bad_pip <- st_join(tmp_dpoints_joined_bad_sf, states, st_within) %>% select(ID, State, Address, GEOID.y, STUSPS.y, Latitude, Longitude, Location, City, State, ZipCode, County)
+
+```
+
+Okay! This new SF object with the probably-too-long-a-name has the following:
+(1) the ID of each bad record
+(2) the State that FE linked to the event
+(3) the address of the event
+(4) the correct GEOID and State
+(5) the point data of the event.
+
+Now I can use a geocoder API to get the correct coordinates from the addresses supplied by Fatal Encounters. I tried several including the Census geocoder, OSM, and ArcGIS. ArcGIS was the only one that reliably and accurately converted all of the addresses to the correct coordinates:
+
+```{r}
+
+tmp_geocode_arcgis <- geocode(tmp_dpoints_joined_bad_pip, address = Address, method = "arcgis")
+
+
+```
+
+With the coordinates properly built from the addresses, it is time to update our FE records with the correct coordinate data for the bad records.
+
+```{r}
+
+## dropping unnecessary variables and changing column names and variable types to match in preparation for the merge
+tmp_new_coords <- tmp_geocode_arcgis %>% mutate(Latitude = as.character(lat), Longitude = long) %>% select (ID, Latitude, Longitude)
+
+## creating the FE dataframe that will be used moving forward
+d <- tmp_d
+
+## merging the fixed coordinates into the FE DF
+d <- rows_update(d, tmp_new_coords)
+```
+
+There are a few rows with a value for Race but not RaceImputed, which is not expected. I am going to update those rows, that will also need to be reported to FE.
+
+```{r}
+
+tmp_race_check <- d %>% filter(RaceImputed == "Race unspecified") %>% select(ID, Race) %>% mutate(RaceImputed = Race) %>% select(!Race)
+
+d <- rows_update(d, tmp_race_check)
+
+
+```
+
+There is one record that could not be properly geocoded. Even when I manually input the address and try to convert it to coordinates, it just doesn't take. I am going to drop that event from analysis. That may or may not be something to look into more in the future. I could grab coordinates from a business or intersection nearby, I'm not completely sure if that is a better or worse solution. Likely it's a better solution. It's ID 9585
+
+```{r}
+
+## dropping troublesome event with bad address data
+d <- d %>% filter(ID != 9585)
+
+
+```
+
+The last thing to address for cleaning the FE data is the MENA racial category. There isn't currently an equivalent racial category in the Census data. There are presently 30 MENA victims in the FE data. I am going to drop them from analysis for simplicity's sake now. This may be a consideration to return to.
+
+```{r}
+
+d <- d %>% filter(RaceImputed != "Middle Eastern")
+
+
+```
+
+
+Now I remove the temporary files to keep my environment under control.
+
+```{r}
+
+rm(tmp_d, tmp_d_all, tmp_dpoints, tmp_dpoints_joined_bad_df, tmp_dpoints_joined_bad_pip, tmp_dpoints_joined_bad_sf, tmp_geocode_arcgis, tmp_new_coords, tmp_race_check, tmp_dpoints_joined, tmp_dpoints_joined_bad, tmp_dpoints_split)
+
+
+```
+
+## Creating the state-level point-in-polygon SF objects
+
+With my FE database properly cleaned and the bad coordinate data updated, I can create a new SF object which has each fatal encounter placed in the Census region it occurred within.
+
+First I will convert the DF into an SF object, converting the coordinates to points.
+
+```{r}
+
+## remove = false here retains the coordinates that are converted to points. This is a fail safe in case there are any other geodata issues.
+dpoints <- d %>% st_as_sf(coords = c("Longitude", "Latitude"), crs = "NAD83", remove = FALSE)
+
+
+```
+
+Next I will create a point-in-polygon SF object, this is to be eventually mapped.
+```{r}
+
+states_pip <- st_join(dpoints, states, st_within)
+
+
+```
+
+
+Next, I want to generate the following:
+A count of FEs by state.
+A count of FEs by race by state.
+The percent population by race by state.
+The level of over or under-representation in Fatal Encounters for each racial group by state.
+
+```{r}
+
+## generating the count of fatal encounters by state
+states_count <- d %>% count(State, name = "fe_count")
+
+## counting the number of victims by race, per state
+tmp_count_race <- d %>% count(State, RaceImputed)
+
+## converting this count from long to wide, and filling zeroes for racial groups with no FEs in each state
+states_count_race <- tmp_count_race %>% 
+  pivot_wider(id_cols = State,
+              names_from = RaceImputed,
+              values_from = n,
+              values_fill = 0) %>% 
+  clean_names() %>% 
+  
+## cleaning up race variables to be more user-friendly  
+  rename(black = african_american_black,
+         asian = asian_pacific_islander,
+         white = european_american_white,
+         hispanic = hispanic_latino,
+         native = native_american_alaskan) %>% 
+ 
+## calculating the percent of FEs each racial group represents per state  
+   mutate(fe_count = states_count$fe_count) %>% 
+  mutate(asian_fe = asian / fe_count * 100,
+         black_fe = black / fe_count * 100,
+         hispanic_fe = hispanic / fe_count * 100,
+         native_fe = native / fe_count * 100,
+         white_fe = white / fe_count * 100) %>% 
+ 
+## attaching population percent for each racial group per state  
+   mutate(pct_asian = states$pct_asian,
+         pct_blk = states$pct_blk,
+         pct_hispanic = states$pct_hispanic,
+         pct_native = states$pct_native,
+         pct_white = states$pct_white) %>% 
+  
+## constructing variable, percentage points over or underrepresented in FEs per racial group by state   
+  mutate(asian_dif = asian_fe - pct_asian,
+         black_dif = black_fe - pct_blk,
+         hispanic_dif = hispanic_fe - pct_hispanic,
+         native_dif = native_fe - pct_native,
+         white_dif = white_fe - pct_white)
+```
+
+Next I will identify the most over and under-represented racial groups for each state.
+
+```{r}
+
+## capturing the max and min differences in population percent and FE percent by state
+states_count_race_id <- states_count_race %>% group_by(state) %>%  summarise(max_dif = pmax(asian_dif, black_dif, hispanic_dif, native_dif, white_dif),
+                                                                             min_dif = pmin(asian_dif, black_dif, hispanic_dif, native_dif, white_dif))
+
+
+```
+
+
+Next I will capture the racial groups that are most over or under-represented, what percent they are over or under, and merge that all into one place.
+```{r}
+
+## in these next few lines I will capture the racial groups that are the most 
+tmp_states_dif <- states_count_race %>% select(asian_dif, black_dif, hispanic_dif, native_dif, white_dif)
+
+tmp_states_dif <- tmp_states_dif %>% mutate(max_race = colnames(tmp_states_dif)[apply(tmp_states_dif, 1, which.max)], min_race = colnames(tmp_states_dif)[apply(tmp_states_dif, 1, which.min)])
+
+tmp_states_dif <- tmp_states_dif %>% mutate(max_dif = states_count_race_id$max_dif, min_dif = states_count_race_id$min_dif, state = states_count_race_id$state)
+
+states_dif <- tmp_states_dif %>% select(state, max_race, max_dif, min_race, min_dif)
+
+## removing temporary files to keep environment clean
+rm(tmp_count_race, tmp_states_dif, states_count_race_id)
+```
+
+Next I will generate some general summary statistics for FE counts by state across the US.
+```{r}
+
+
+states_summary <- states_count %>% summarise(states_mean = mean(fe_count), states_median = median(fe_count), states_iqr = IQR(fe_count), states_sd = sd(fe_count), states_min = min(fe_count), states_max = max(fe_count))
+
+
+```
+
+Before I begin describing my data, it will be helpful to name explicitly what I am interested in knowing:
+
+(1) What percent of fatal encounters does each racial group represent in each state?
+(1a) How does this compare to the population distribution of each racial group in each state? (checking for (dis)proportionality)
+
+(2) In which state does each racial group experience the most over or under-representation (one state per racial group)
+
+(3) How does the racial distribution of fatal encounters in each state compare to the distribution nationally? (this begins to press on the question "At which levels of aggregation are assessments of police use of lethal force most informative?")
+
+(4) Iteratively answering these same questions at the national level, county level, tract level, block group level, and potentially block level.
+
+The logical next step is to capture Census data at a smaller level of aggregation. I should be able to use a majority of the code above to create these new SF objects.
+
+## county-level
+
+Getting county level Census geographies and race population data
+
+```{r}
+
+counties <- get_decennial(year = 2020,
+                             geography = "county",
+                             geometry = TRUE,
+                             sumfile = "pl",
+                             variables = racecats,
+                             cache_table = TRUE,
+                             summary_var = "P2_001N",
+                             output = "wide",
+                        keep_geo_vars = TRUE)
+
+
+
+## creating race percent variables
+counties <- counties %>% mutate(pct_blk = Black / summary_value * 100,
+                            pct_white = White / summary_value * 100,
+                            pct_hispanic = Hispanic / summary_value * 100,
+                            pct_asian = Asian / summary_value * 100,
+                            pct_native = Native / summary_value * 100)
+
+
+
+
+```
+
+
+Creating a county-level SF pip object with coordinates 
+
+```{r}
+
+counties_pip <- st_join(dpoints, counties, st_within)
+
+
+```
+
+This new county-level pip object is helpful because it links each Fatal Encounter with a GEOID, in this case instead of representing a state, each GEOID represents a county.
+
+The next step is to calculate FE counts per county, then as with states, population percentages for each, then percent fatal encounters by race by county, then the over or under-representation of each group per county.
+
+Working with the county data uncovers a problem that wasn't relevant at the state level. There are counties that have zero counts of Fatal Encounters in the data. So am I interested in including those or not?
+
+If included, the counties where there are fatal encounters will be represented as having worse rates of police use of lethal force in summary statistics. Put differently, the zero count counties will drag down the averages of police use of force across all counties.
+
+If excluded, the question becomes, in the counties where people are killed by police, what is the racial makeup of those counties? How does the racial population percent in counties where people are killed by police compare to the distribution of police killings by race in those counties?
+
+On first assessment, the second version (dropping zero count counties) seems intuitively closer to what I'm interested in. I also think that there are some interesting concepts to explore in the zero count counties:
+Thinking proximity to counties that do have FEs, racial demographic makeup of zero-count counties, etc.
+
+I will want to return to thinking about this, but for now I am going to proceed with dropping the zero-count counties.
+
+
+```{r}
+
+## generating the count of fatal encounters by county
+## the sf package automatically creates a variable that includes both the county name and the state name, convenient here.
+counties_count <- counties_pip %>% count(NAME.y, name = "fe_count")
+####
+## counting the number of victims by race, per county
+## converting to tibble here as SF object doesn't play well with count() at times.
+tmp_counties_count_race <- counties_pip %>% count(NAME.y, RaceImputed) %>% as_tibble()
+
+## converting this count from long to wide, and filling zeroes for racial groups with no FEs in each county
+counties_count_race <- tmp_counties_count_race %>% 
+  pivot_wider(id_cols = NAME.y,
+              names_from = RaceImputed,
+              values_from = n,
+              values_fill = 0) %>% 
+  clean_names() %>% 
+  
+## cleaning up race variables to be more user-friendly  
+  rename(black = african_american_black,
+         asian = asian_pacific_islander,
+         white = european_american_white,
+         hispanic = hispanic_latino,
+         native = native_american_alaskan) %>% 
+ 
+## calculating the percent of FEs each racial group represents per county  
+   mutate(fe_count = counties_count$fe_count) %>% 
+  mutate(asian_fe = asian / fe_count * 100,
+         black_fe = black / fe_count * 100,
+         hispanic_fe = hispanic / fe_count * 100,
+         native_fe = native / fe_count * 100,
+         white_fe = white / fe_count * 100)
+ 
+
+rm(tmp_counties_count_race)
+
+```
+
+
+I am breaking this object creation into two chunks to troubleshoot. This is a touch more complicated than states given that there are counties without fatal encounters. I can't just mutate the county percents from the counties SF object.
+
+I think what I can do is join the counties object into the counties_count_race object, match on county, and drop counties which aren't found in counties_count_race.
+
+```{r}
+
+## creating a new DF that just has the percent variables I need, and the county name to match on
+tmp_counties <- counties %>% as_tibble() %>% select(NAME.y, pct_blk, pct_white, pct_hispanic, pct_asian, pct_native, STUSPS) %>% clean_names()
+
+## joining the new DF into the DF with the FE rates by race and county
+counties_count_race <- left_join(counties_count_race, tmp_counties, by = join_by("name_y"))
+
+rm(tmp_counties)
+```
+
+
+Great, now I have a DF with all of the counties where fatal encounters occurred, counts of FEs by race in those counties, the percentage of all fatal encounters in those counties by race, and the population percent of each racial group in those counties. With all of this I should be able to construct the over / under-representation variables.
+
+```{r}
+
+## constructing variable, percentage points over or underrepresented in FEs per racial group by county  
+counties_count_race <- counties_count_race %>%   mutate(asian_dif = asian_fe - pct_asian,
+         black_dif = black_fe - pct_blk,
+         hispanic_dif = hispanic_fe - pct_hispanic,
+         native_dif = native_fe - pct_native,
+         white_dif = white_fe - pct_white)
+```
+
+Okay, so this object shows me the discrepancy in population percentages and fatal encounter rates in the counties where fatal encounters occurred. It seems like here percentages and percentage over/under-representation are not the most useful, because around 50% of counties with fatal encounters only had one or two.
+
+I'm reviewing what I did in my second-year paper to address this.
+
+What if I compared the population percents of each racial group in a state (overall) to the average population percent of each racial group in the counties where people were killed by police in that state?
+
+
+## trying out some different ways to assess disproportionality
+
+I'm choosing Georgia, a top 10 state by fatal enocounters, and one that is relatively racially hetergenous. I'm going to compare Georiga's overall racial demographics with the racial demographics of the counties in Georgia where people were killed by police.
+
+```{r}
+
+## getting Georgia Census data
+georgia <- get_decennial(year = 2020,
+                             geography = "state",
+                             state = "GA",
+                             geometry = TRUE,
+                             sumfile = "pl",
+                             variables = racecats,
+                             cache_table = TRUE,
+                             summary_var = "P2_001N",
+                             output = "wide",
+                        keep_geo_vars = TRUE)
+
+
+
+## creating race percent variables
+georgia <- georgia %>% mutate(pct_blk = Black / summary_value * 100,
+                            pct_white = White / summary_value * 100,
+                            pct_hispanic = Hispanic / summary_value * 100,
+                            pct_asian = Asian / summary_value * 100,
+                            pct_native = Native / summary_value * 100)
+
+```
+
+Now I can extract the Georgia counties where people were killed by police from counties_count_race
+
+```{r}
+
+georgia_counties_count <- counties_count_race %>% filter(stusps == "GA")
+
+mean(georgia_counties_count$pct_blk)
+mean(georgia_counties_count$pct_white)
+mean(georgia_counties_count$pct_hispanic)
+mean(georgia_counties_count$pct_asian)
+mean(georgia_counties_count$pct_native)
+```
+
+Okay, so if I get the mean percent of places where people were killed by police, I get the following:
+In counties where people were killed by police, the average population percent by race was as follows:
+Black - 27%
+White - 59%
+Hispanic - 1.7%
+Native - 0.2%
+
+At first glance this might make it look like whiter counties are overrepresented. The problem here though is that it isn't the case that each county has one killing. There are several counties with much higher rates of killings by police. This means I need to either weigh though counties more heavily, or count the FEs in those counties multiple times. 
+
+Something that I think would work is filtering the counties_pip object. That already has each event as discrete, as well as the racial population percentages of each county there. If I filter that SF object to only Georgia then average the racial population percentages, I think that will be more informative.
+
+```{r}
+
+## creating an SF object that just has fatal encounters in Georgia, this has each individual killing and the racial makeup of the county the event occurred in.
+georgia_counties_pip <- counties_pip %>% filter(STUSPS == "GA")
+
+## calculating the average racial population percent of the counties where people were killed by police
+tmp_georgia_pcts <- georgia_counties_pip %>% summarise(fe_pct_blk = mean(pct_blk), fe_pct_white = mean(pct_white), fe_pct_hispanic = mean(pct_hispanic), fe_pct_asian = mean(pct_asian), fe_pct_native = mean(pct_native))
+```
+
+I have on average, the racial population makeup expected for each county in Georgia where people were killed by the police. Can I fairly compare this to the population percents by race in all counties in Georgia?
+
+I might say: On average, a person killed by police in Georiga was killed in a county that is 32% Black and 49% White; however, the average county in Georiga is X% Black and X% White.
+
+What are the average population percentages by county in Georgia?
+
+```{r}
+
+## capturing the average population percent of each racial group in each Georgia county
+georgia_counties <- counties %>% filter(STUSPS == "GA")
+
+tmp_georgia_counties_pcts <- georgia_counties %>% summarise(mean_pct_blk = mean(pct_blk), mean_pct_white = mean(pct_white), mean_pct_hispanic = mean(pct_hispanic), mean_pct_asian = mean(pct_asian), mean_pct_native = mean(pct_native))
+```
+
+So the statement would be: On average, a person killed by police in Georgia was killed in a county that is 32% Black and 49% White; however, the average county in Georgia is 27% Black and 60% White.
+
+This is interesting, and might be something; however, does this have the same problem as above? Say a county has 50 residents and 48 of them are white, that very high percentage would drive up the average when comparing to say a county with 100,000 residents where 70,000 of them are white.
+
+I am not sure if that is a weighting issue or an aggregation level issue. If I was at a smaller level of aggregation, say block group, the populations are much smaller, maybe 1000 people or so.
+
+I'm thinking that what I might be interested in is saying: the average racial population percent of counties in Georgia where people were killed by police is X%, but a random person on average will live in a county with racial demographics of Y%.
+
+I fear I am getting a bit lost in the sauce here.
+I think I may be on to something here in weighting the racial population percents of each county. I think that would give fair information. I could ask Kieran or Steve about that. I also don't want to get too stuck on this, because I do really want to get to building some maps, and I also really want to look at race of victim and place data.
+
+## Race and place
+
+Jotting down some things I'm thinking about that I haven't yet explored that I'm interested in. This will be a starting point for next time:
+
+In places with low populations of Black people (thinking high concentration or high segregation areas), for the Black people who were killed by police, what is the racial makeup of the county / tract / block group where they were killed?
+
+I'm interested in this question because of a sort of out-of-place hypothesis. That is, we know that Black and brown neighborhoods (block groups probably), are overpoliced, and thus there is higher risk of police contact in those areas. However, if a Black or brown person is in a predominately white neighborhood (block group), do we see that they might be at higher risk of dying by police?
+
+A place to start getting at this would be to get Census block group data, maybe for a highly segregated Census tract, and look at the population percentages of the block groups where people were killed by police. I hypothesize that of course most people who were killed by police will have died in a block group where they are not the racial minority; however, we will see unique outliers in Black victims who were killed in overwhelmingly white neighborhoods, and we won't see the inverse (white people dying in overwhelmingly Black neighborhoods).
+
+Maybe LA county would be an interesting place to start. A massive county with huge racial and income segregation, and a brutal police force.
+
+```{r}
+
+la_block_groups <- get_decennial(year = 2020,
+                             geography = "block group",
+                             state = "CA",
+                             county = "Los Angeles",
+                             geometry = TRUE,
+                             sumfile = "pl",
+                             variables = racecats,
+                             cache_table = TRUE,
+                             summary_var = "P2_001N",
+                             output = "wide",
+                        keep_geo_vars = TRUE)
+
+## creating race percent variables for block groups
+## some block groups have 0 population, dropping those
+la_block_groups <- la_block_groups %>% mutate(pct_blk = Black / summary_value * 100,
+                            pct_white = White / summary_value * 100,
+                            pct_hispanic = Hispanic / summary_value * 100,
+                            pct_asian = Asian / summary_value * 100,
+                            pct_native = Native / summary_value * 100) %>% filter(summary_value != 0)
+```
+
+
+```{r}
+
+## merging point FE data with Census LA block group data
+la_block_groups_pip <- st_join(dpoints, la_block_groups, st_within)
+
+## dropping points that did not occur in LA county
+la_block_groups_pip <- la_block_groups_pip %>% filter(!is.na(GEOID))
+
+## what are the average racial population percentages of the block groups where people are killed by the police in LA County?
+la_block_groups_fe_pcts <- la_block_groups_pip %>%  summarise(fe_pct_blk = mean(pct_blk), fe_pct_white = mean(pct_white), fe_pct_hispanic = mean(pct_hispanic), fe_pct_asian = mean(pct_asian), fe_pct_native = mean(pct_native))
+```
+
+The average LA block group is the following percent each race:
+
+```{r}
+
+mean(la_block_groups$pct_blk)
+mean(la_block_groups$pct_white)
+mean(la_block_groups$pct_hispanic)
+mean(la_block_groups$pct_asian)
+mean(la_block_groups$pct_native)
+
+
+```
+Black block groups overrepresented, white block groups massively underrepresented, Hispanic block groups massively overrepresented. Still want to get help with figuring out if I need to weight, etc., but this is an interesting start. It tracks to some degree just with overpolicing and use of force for those racial groups in that area generally.
+
+The next step for my above question about being out-of-place is to filter the Block groups pip by just Black victims, then look at the block groups where they died, what is the racial makeup?
+
+I am just going to take a peek at this now, in the future it would probably be helpful to have this be a DF. rows could be racial groups, columns could be FE count, population % white in the block group they were killed, population % Black in the block group they were killed, etc.
+
+```{r}
+
+tmp_la_block_group_pip_black <- la_block_groups_pip %>% filter(RaceImputed == "African-American/Black")
+
+mean(tmp_la_block_group_pip_black$pct_blk)
+mean(tmp_la_block_group_pip_black$pct_white)
+mean(tmp_la_block_group_pip_black$pct_hispanic)
+mean(tmp_la_block_group_pip_black$pct_asian)
+mean(tmp_la_block_group_pip_black$pct_native)
+```
+
+Okay interesting. Going to sign off soon, but I just realized I sort of overcomplicated part of the question here. What I really want to know is, in LA county, when police kill people in severely white areas, what is the race of the victim?
+
+Last thing as an effort to take a quick glance at that, because I think I'm onto something there, and this could be looked at at the block group level in every state:
+
+```{r}
+
+tmp_la_block_groups_pip_pcts <- la_block_groups_pip %>% select(RaceImputed, pct_white, pct_blk, pct_hispanic, pct_asian, pct_native)
+
+
+```
+
+Okay so I can sort this to get a better look just immediately. I'm really interested to look at this in a place other than LA which has sort of a unique racial makeup. But counting rows (19 visible on screen currently)
+
+high white pop block groups (82% - 64%): 7 racial outsiders killed, 5 Hispanic, 2 Black (36% outsiders)
+high Black pop block groups (77% - 47%): 3 racial outsiders killed, 3 Hispanic (15% outsiders)
+high Hispanic pop block groups (98% - 96%): 2 racial outsiders killed, 2 white (10% outsiders)
+
+- (population percentages near 100% here for Hispanic high population block groups. Are these white people, or FE coding Latinx people as white? I can check the news articles)
+
+high Asian pop block groups (83% - 51%): 13 racial outsiders killed, 6 Hispanic, 2 Black, 5 white (68% outsiders)
+
+
+high Native pop block groups: highest BG % native 2%, no native victims in those block groups
+
+
+From this perspective of racial outsiders, what I'm interested in doing next is identifying how many people were racial outsiders in the Block group they were killed in. There are a few ways to conceptualize this:
+
+- Racial outsider is when a person is in a neighborhood where their racial group is not the majority race.
+- Racial outsider is when a person is in a block group that their racial group makes up less than 50% of the population.
+- Racial outsider is when a POC is in a neighborhood that is majority white.
+- Racial outsider is when a Black person is in a neighborhood that is majority white.
+
+I think the most clear starting place is 50%. A person is a racial outsider when they are in a neighborhood that is 50% or more another race. So the starting point is to filter all block groups in LA County where people were killed by police and the racial population percent of the block group they were killed in is 50% or more of a given race, then look at what the race of the victim was. There will be interesting stuff there.
+
+```{r}
+
+## I can grepl this for all racial groups I think tomorrow
+tmp_la_block_groups_maj_white <- tmp_la_block_groups_pip_pcts %>% filter(pct_white > 50)
+
+tmp_la_block_groups_maj_white_count <- tmp_la_block_groups_maj_white %>% count(RaceImputed)
+
+```
+A quick review of that last chunk, and I think I'm onto something interesting. It would be cool to build a DF with block groups that are x > 50% of each racial group and see how many people from each group died in those blocks.
+
+
+*** doing the same as above, looking at a different racial group and the races of the people killed in a block group that is 50% or more black
+
+```{r}
+
+tmp_la_block_groups_maj_blk <- tmp_la_block_groups_pip_pcts %>% filter(pct_blk > 50)
+
+tmp_la_block_groups_maj_blk_count <- tmp_la_block_groups_maj_blk %>% count(RaceImputed)
+
+
+```
+
+trying with hispanic
+
+```{r}
+
+tmp_la_block_groups_maj_hispanic <- tmp_la_block_groups_pip_pcts %>% filter(pct_hispanic > 50)
+
+tmp_la_block_groups_maj_hispanic_count <- tmp_la_block_groups_maj_hispanic %>% count(RaceImputed)
+
+
+```
+
+
+
+
+```{r}
+
+
+tmp_la_fifty <- tmp_la_block_groups_pip_pcts %>% as_tibble() %>% select(!geometry) %>% mutate(RaceImputed = as.factor(RaceImputed)) %>%   filter(pct_white > 50 | pct_blk > 50 | pct_hispanic > 50 | pct_asian > 50 | pct_native > 50)
+
+```
+
+Okay. Not bad. This object has all of the block groups where a person was killed by police and the population is > 50% one race. Now I can look at the races of the people who were killed in those block groups.
+
+```{r}
+
+## making individual data frames with the number of victims of each race killed in neighborhoods (block groups) with > 50% population one race.
+
+tmp_la_fifty_white <- tmp_la_fifty %>% filter(pct_white > 50) %>% count(RaceImputed, name = 'maj_white')
+
+tmp_la_fifty_blk <- tmp_la_fifty %>%  filter(pct_blk > 50) %>% count(RaceImputed, .drop = FALSE, name = 'maj_blk')
+
+tmp_la_fifty_hispanic <- tmp_la_fifty %>%  filter(pct_hispanic > 50) %>% count(RaceImputed, .drop = FALSE, name = 'maj_hispanic')
+
+tmp_la_fifty_asian <- tmp_la_fifty %>%  filter(pct_asian > 50) %>% count(RaceImputed, .drop = FALSE, name = 'maj_asian')
+
+tmp_la_fifty_native <- tmp_la_fifty %>%  filter(pct_native > 50) %>% count(RaceImputed, .drop = FALSE, name = 'maj_native')
+
+```
+
+Kinda close on above. I think I can do this with fresh eyes and more energy, tomorrow!
+
+having some trouble. return with meds and a fresh brain. this should help: https://github.com/tidyverse/dplyr/issues/5292
+
+
+Now that I have a DF with the number of people of each racial group killed in neighborhoods where there was a 50%+ racial group, it would be helpful to combine them.
+
+Since there are no majority Native block groups, I am going to drop these for now.
+
+```{r}
+
+la_fifty_count <- left_join(tmp_la_fifty_white, tmp_la_fifty_blk) %>% 
+  left_join(., tmp_la_fifty_hispanic) %>% 
+  left_join(., tmp_la_fifty_asian)
+
+rm(tmp_la_block_group_pip_black, tmp_la_block_groups_maj_blk, tmp_la_block_groups_maj_blk_count, tmp_la_block_groups_maj_hispanic, tmp_la_block_groups_maj_hispanic_count, tmp_la_block_groups_maj_white, tmp_la_block_groups_maj_white_count, tmp_la_block_groups_pip_pcts, tmp_la_fifty, tmp_la_fifty_asian, tmp_la_fifty_blk, tmp_la_fifty_hispanic, tmp_la_fifty_native, tmp_la_fifty_white)
+
+```
+
+Now I have a single data frame which has the number of people of each race killed by police in block groups where there is one racial group representing more than half of the population. To describe and understand this data it would be helpful to build percents for each victim race in each neighborhood type.
+
+```{r}
+
+tmp_la_fifty_count <- la_fifty_count %>% mutate(white_bg_percent = round(maj_white / sum(maj_white) * 100, 1)) %>% 
+  mutate(blk_bg_percent = round(maj_blk / sum(maj_blk) * 100, 1)) %>% 
+  mutate(hispanic_bg_percent = round(maj_hispanic / sum(maj_hispanic) * 100, 1)) %>% 
+  mutate(asian_bg_percent = round(maj_asian / sum(maj_asian) * 100, 1))
+
+
+```
+
+Okay, some information:
+
+What percent of people killed in majority one-race block groups are of the majority race for that block group?
+
+Black: 87%
+White: 57%
+Hispanic: 62%
+Asian: 30% (not highest)
+
+I want to try to make an SF object that only has the LA block groups where people were actually killed by police, that way I can more easily show the race percentages of those block groups. This is because there are 6575 LA block groups so that's way too much visual information to be helpful when mapping.
+
+```{r}
+
+la_block_groups_geoids <- unique(la_block_groups_pip$GEOID)
+
+la_block_groups_true <- la_block_groups %>% filter(grepl(paste(la_block_groups_geoids, collapse = "|"), GEOID))
+```
+
+
+I could probably visualize this as a map.
+
+```{r}
+
+mapview(la_block_groups_pip, cex = 3, zcol = "RaceImputed")+
+  mapview(la_block_groups_true, zcol = "pct_white")
+
+```
+
+This is a good starting place for a map. What is immediately clear is that as the population percent (white) decreases, the representation of block groups where cops killed people increases.
+
+
+# Data Description
+
+I will begin by replicating the analyses from my second-year paper, with confidence that the geodata is correct and the data is properly cleaned.
+
+## State-level
+
+```{r}
+## the percent of fatal encounters that occur in states with different racial majorities
+states_pcts <- tibble(pct_fe_maj_white = states_pip %>% filter(maj_white == "yes") %>% nrow()/nrow(states_pip)*100,
+                     pct_fe_maj_blk = states_pip %>% filter(maj_blk == "yes") %>% nrow()/nrow(states_pip)*100,
+                     pct_fe_maj_hisp = states_pip %>% filter(maj_hisp == "yes") %>% nrow()/nrow(states_pip)*100,
+                     pct_fe_maj_asian = states_pip %>% filter(maj_asian == "yes") %>% nrow()/nrow(states_pip)*100,
+                     )
+```
+
+x% of fatal encounters happen in majority white states, x% of states are majority white by population. continue with counties and tracts

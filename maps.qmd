@@ -1,0 +1,922 @@
+---
+title: "maps"
+format: html
+editor:
+  mode: source
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loading libraries, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(tidycensus)
+library(tidygeocoder)
+library(tigris)
+library(sf)
+library(mapview)
+library(tmap)
+library(purrr)
+library(png)
+library(knitr)
+library(modelsummary)
+library(corrr)
+library(tinytex)
+library(janitor)
+library(viridis)
+library(leafpop)
+library(leaflet)
+library(magick)
+
+
+knit_hooks$set(crop = knitr::hook_pdfcrop)
+options(tigris_use_cache = TRUE)
+```
+
+# Data Importing and Cleaning
+
+## Fatal Encounters
+
+### Import, Wrangling, Variable Creation
+
+```{r FE data setup to d_all, include=FALSE}
+
+## loading raw data into R
+tmp_d <- read.csv("FE.csv")
+
+## first removing placeholder row from FE, 
+## next selecting interesting variables
+tmp_d <- tmp_d %>% subset(Location.of.injury..address. != "This row is a spacer for Fatal Encounters use.") %>% 
+select(
+  Unique.ID,
+  Age,
+  Gender,
+  Race,
+  Race.with.imputations,
+  Location.of.injury..address.,  
+  Location.of.death..city.,
+  State,
+  Location.of.death..zip.code.,
+  Location.of.death..county.,
+  Full.Address,
+  Latitude,
+  Longitude,
+  Agency.or.agencies.involved,
+  Highest.level.of.force,
+  Date.of.injury.resulting.in.death..month.day.year.,
+  Intended.use.of.force..Developing.)
+
+## Renaming annoying variables
+tmp_d <- tmp_d %>% rename(ID = Unique.ID,
+                    Location = Location.of.injury..address.,
+                    City = Location.of.death..city.,
+                    ZipCode = Location.of.death..zip.code.,
+                    County = Location.of.death..county.,
+                    Address = Full.Address,
+                    Agency = Agency.or.agencies.involved,
+                    ForceType = Highest.level.of.force,
+                    ForceIntent = Intended.use.of.force..Developing.,
+                    RaceImputed = Race.with.imputations,
+                    Date = Date.of.injury.resulting.in.death..month.day.year.)
+
+## converting date
+tmp_d <- tmp_d %>% mutate(Date = mdy(Date), Year = year(Date))
+
+## removing corrupted entry which includes comma, ID 28891, report to FE
+tmp_d <- tmp_d %>% filter(ID != "28891")
+
+
+## preserving unfiltered FE dataframe
+tmp_d_all <- tmp_d
+
+```
+
+```{r FE setup remaining filters, include=FALSE}
+
+## extracting desired years, 2010 - 2019
+tmp_d <- tmp_d %>% filter(Year >= 2010 & Year <= 2019)
+
+## filtering events with no race data, needs | instead of & for some reason, but it definitely works
+## there is also one record with NA for RaceImputed (the main race variable) so I'm filtering that out too.
+tmp_d <- tmp_d %>% filter(Race != "Race unspecified" | RaceImputed != "Race unspecified") %>% filter(!is.na(RaceImputed))
+
+
+## filtering by force types
+types <- c("Gunshot", "Tasered", "Asphyxiated/Restrained", "Chemical agent/Pepper spray", "Beaten/Bludgeoned with instrument", "Restrain/Asphyxiation")
+tmp_d <- tmp_d %>% filter(grepl(paste(types, collapse = "|"), ForceType))
+
+```
+
+Now that I have this all filtering properly I'm left with 12097 records for d as opposed to the 10778 I had in the previous analysis
+
+Okay, now that I have the DF filtered by years, with NA race values excluded, and by relevant force types, I create my sf object by converting the coordinates to points. I know there are some bad geodata in this dataset, so the next step is to get that cleaned up.
+
+### Repairing bad geodata and converting coordinates to points
+
+I think this may be iterative. That is, I think I will need to convert the coordinates to points, then map them and and try to link them to census data. Bad geodata should come back with an NA value for GEOID, then I will have to get the correct coordinates, update d, then make a new repaired dpoints. Let's see.
+
+```{r}
+
+## creating SF object with point data for each event
+tmp_dpoints <- tmp_d %>% st_as_sf(coords = c("Longitude", "Latitude"), crs = "NAD83", remove = FALSE)
+
+
+```
+
+Now I want to make a list of dataframes, one dataframe for each state.
+
+```{r}
+
+## it seems to make this split of the frame work I need to copy dpoints, can't seem to split it when referring to itself
+tmp_dpoints_split <- split(tmp_dpoints, tmp_dpoints$State)
+
+```
+
+The next step will require having US Census states data so that I can link each event with its expected state, events with bad point data will link to the character values of the state, but will not be able to generate a GEOID because the coordinates will be outside the Census boundaries.
+
+As such, before I move forward I will need to grab US Census state data.
+
+## Census Data
+
+First thing I want to think through is wide data vs long data. I found wide easier before, but I'm not convinced that's the best approach. Going to look into this some.
+
+First I'll get the US Census redistricting file in long format, by excluding output = wide
+
+### State-level
+
+```{r}
+
+## One-race only race variables
+racecats <- c(Hispanic = "P2_002N", White = "P2_005N", Black = "P2_006N", Native = "P2_007N", Asian  = "P2_008N")
+
+
+```
+
+I've looked at both outputs and I don't immediately see a use for tidy output. Maybe at a different aggregation level or with different variables. For now I'm sticking with wide.
+
+```{r}
+
+states <- get_decennial(year = 2020,
+                             geography = "state",
+                             geometry = TRUE,
+                             sumfile = "pl",
+                             variables = racecats,
+                             cache_table = TRUE,
+                             summary_var = "P2_001N",
+                             output = "wide",
+                        keep_geo_vars = TRUE)
+
+## filtering out Puerto Rico
+states <- states %>% filter(GEOID != "72")
+
+## creating race percent variables
+states <- states %>% mutate(pct_blk = Black / summary_value * 100,
+                            pct_white = White / summary_value * 100,
+                            pct_hispanic = Hispanic / summary_value * 100,
+                            pct_asian = Asian / summary_value * 100,
+                            pct_native = Native / summary_value * 100)
+
+states <- states %>% arrange(STUSPS)
+
+
+
+
+```
+
+Trying a new summary variable that should be "Total: Population of one race" I think that should be what I want if I'm understand and it's correct
+
+Okay so from looking at an online Census data explorer, the total US population breaks down as follows: Hispanic or Latino = 62 million, population of one race 255 million. Leaving a gap of about 14 million multiracial people. If I use the total population of hispanic and the total population of one race, do I double count some people? Either way, the variables I want are White, Asian, Black, Native people who are NOT Latino or Hispanic, and the total population of Hispanic. I don't see a way immediately to break down Hispanic by race. Maybe it's just okay.
+
+Okay. So I have that in states_new now. What I need to justify is that one-race only counts can have their percentages justifiably determined against the total population. Which is to say, a mulitracial person should not count as Black or white or whatever when computing percentages. I think this is a reasonable thing to assert.
+
+I think moving forward I am going to use these variables and summary values to construct my percentages pretty confidently. I want to run this by Kieran and see what he thinks, if he has run into anything similar, or if this seems reasonable to him.
+
+Next step is to return to assessing disproportionality, then eventually something with the race and place thing.
+
+I've zipped a backup of the website 01 folder in the documents folder on 05/31/23 and dated the file accordingly. I am now going to update my racecats with the new race variables and move forward with assessing disproportionality. (done with updating racecats)
+
+It looks like there is a more clean way to create majority percent variables. I may still want majority white, Black, etc., but this way I can see who is the majority, and what the majority percent is. A bit more clean and informative than the blanket majority percent variable I was creating previously. To do this I do need the tidy data.
+
+```{r}
+
+states_tidy <- get_decennial(year = 2020,
+                             geography = "state",
+                             geometry = TRUE,
+                             sumfile = "pl",
+                             variables = racecats,
+                             cache_table = TRUE,
+                             summary_var = "P2_001N")
+
+## filtering out Puerto Rico
+states_tidy <- states_tidy %>% filter(GEOID != "72")
+
+## creating race percents for tidy data
+states_tidy <- states_tidy %>% mutate(pct = value / summary_value * 100)
+
+## creating dataframe with majority races for each state. I think I could mutate this directly into the wide data, but going one step at a time
+states_maj <- states_tidy %>% group_by(GEOID) %>% filter(pct == max(pct)) %>% rename(maj_race = variable,
+                                                                                     maj_pct = pct)
+```
+
+```{r}
+
+## selecting only the variables I want to join into the wide data
+states_maj <- states_maj %>% select(maj_pct, maj_race)
+
+## joining the new majority race and majority race variables back to the wide US data
+states <- st_join(states, states_maj, st_within)
+
+```
+
+It worked! Cool!
+
+### National level
+
+```{r, eval=FALSE, include=FALSE}
+
+## does this include Puerto Rico?
+
+us <- get_decennial(year = 2020,
+                    geography = "us",
+                    geometry = TRUE,
+                    sumfile = "pl",
+                    variables = racecats,
+                    cache_table = TRUE,
+                    summary_var = "P2_001N",
+                    output = "wide",
+                    keep_geo_vars = TRUE) %>% mutate(pct_blk = Black / summary_value * 100,
+                            pct_white = White / summary_value * 100,
+                            pct_hispanic = Hispanic / summary_value * 100,
+                            pct_asian = Asian / summary_value * 100,
+                            pct_native = Native / summary_value * 100)
+
+  
+```
+
+## Returning to bad geodata repair
+
+Now that I have state-level Census data, I can split the = SF object just as I did the dpoints SF object.
+
+```{r}
+
+tmp_states <- states
+states_split <- split(tmp_states, tmp_states$STUSPS)
+
+
+```
+
+Now that I have a list of SF objects with point data for each state and a list of SF objects for each state by US Census, I can join the two on the State (or STUSPS) character variable, then the records with NA values for GEOID will be the records with bad geodata.
+
+First I need to join each SF object in each of the two lists to the appropriate one from the other list
+
+To do that I'll need a character vector of state abbreviations and a list of SF objects representing each state and the events that are flagged in Fatal Encounters as occurring there.
+
+```{r}
+
+state_letters <- unique(tmp_dpoints$State) %>% str_sort()
+
+## Now I can create a list of SF objects, where each point is linked to the State-level Census geometric data
+tmp_dpoints_joined <- map2(tmp_dpoints_split[state_letters], states_split, st_join)
+
+
+```
+
+Next step is to filter this new list of SF object so that only the records with bad geodata remain. These will be the records with NA values for GEOID.
+
+```{r}
+
+tmp_dpoints_joined_bad <- map(tmp_dpoints_joined, ~filter(.x, is.na(GEOID)))
+## This tmp list can be created here to compare the current list to the filtered one in the next chunk: tmp_dpoints_joined_bad <- dpoints_joined_bad
+
+
+```
+
+Great. This new list of SF objects only has records with NA values. There are several states without any bad points however, which will make the next steps more messy, so I am going to filter those out before proceeding.
+
+```{r}
+
+tmp_dpoints_joined_bad <- tmp_dpoints_joined_bad %>% discard(~nrow(.) == 0)
+
+
+```
+
+Okay. This next part takes a few steps but it is an important check.
+
+In order to know what state these events actually occurred in, I'll need to: (1) Convert this list to an SF object (first to a DF). (2) Join the SF object to the states Census SF object. This will allow each point to populate its correct GEOID and state name, while also retaining the incorrect state name.
+
+```{r}
+
+## transforming the list of SF objects to a single DF
+tmp_dpoints_joined_bad_df <- list_rbind(tmp_dpoints_joined_bad)
+
+## converting the new DF to an SF object
+tmp_dpoints_joined_bad_sf <- tmp_dpoints_joined_bad_df %>% st_as_sf(crs = "NAD83", remove = FALSE)
+
+## Creating SF pip object with bad points and US Census data
+## I could probably do this bind more cleanly above so that there aren't STUSPS.x STUSPS.y etc.
+tmp_dpoints_joined_bad_pip <- st_join(tmp_dpoints_joined_bad_sf, states, st_within) %>% select(ID, State, Address, GEOID.y, STUSPS.y, Latitude, Longitude, Location, City, State, ZipCode, County)
+
+```
+
+Okay! This new SF object with the probably-too-long-a-name has the following: (1) the ID of each bad record (2) the State that FE linked to the event (3) the address of the event (4) the correct GEOID and State (5) the point data of the event.
+
+However, this does not have the coordinate data for each bad event. Will that be an issue or can I use the point data in its place?
+
+It may be possible to convert the points back to coordinates, but I think it's best to not play telephone with this, and just to go back to where the coordinates were dropped (when converting to SF object), and change an argument so as to retain the coordinates.
+
+I went back to the creation of depoints and changed the argument for removing the original coordinates when converting to points as FALSE. Okay cool, had to update that syntax in one other spot where st_as_sf was used, and now the coordinates are preserved throughout.
+
+Overall we are looking at 28 bad records. Previously I went into google maps and manually geocoded each of these. I wonder if there is a more efficient and reliable way to do this. That is the next thing I want to take a look at.
+
+I am going to see if I can do this reliably at all using tidygeocoder. Many of these addresses are partials or cross-streets or some other unreliable address type, which might be why they were wrong in the first place. Going to try either way.
+
+### Trying automated geocoding of bad records
+
+```{r, eval=FALSE}
+
+tmp_geocode_census <- geocode(tmp_dpoints_joined_bad_pip, street = Location, city = City, state = State, postalcode = ZipCode, method = "census")
+
+#tmp_geocode_osm_one_line <- geocode(dpoints_joined_bad_pip, address = Address)
+```
+
+So far it seems Census geocoder catches more of them. but there is at least one that OSM gets that census didn't. Gonna try OSM multi line input
+
+```{r, eval=FALSE}
+
+tmp_geocode_osm_multi <- geocode(tmp_dpoints_joined_bad_pip, street = Location, city = City, county = County, state = State, postalcode = ZipCode)
+# is this doing multi? there is no method set
+
+```
+
+Multi captured one more than single, no less, but didn't capture any new ones missed by Census. So I will comment out the single-line.
+
+Seems both Census and OSM multi have events the other missed.
+
+Next I will try another free geocoder API, arcgis probably Refer here if need be: https://rdrr.io/cran/tidygeocoder/man/geo.html
+
+```{r}
+
+tmp_geocode_arcgis <- geocode(tmp_dpoints_joined_bad_pip, address = Address, method = "arcgis")
+
+
+```
+
+Wait... ArcGis just did it all and it looks like they are accurate. I checked five or six randomly. I checked every point that Census and/or OSM successfully captured and ArcGis agreed in every isntance. I'm going to move forward confident this is correct. After I merge in the new latitudes and longitudes I'll have to check for any NA values left on GEOIDs on the new SF object anyways which will be its own reliability check.
+
+### Merging the repaired coordinates into the data
+
+So I think I need to join the objects to update the coordinates.
+
+(1) First I will convert this DF with the correct coordinates and points to an SF object.
+(2) Then I will filter so I only keep the ID, latitude and longitude, and geometry (which saves by default due to it being an SF object)
+(3) Finally I will merge this object into the original data. I think I may want to merge the lat and long into d first, then the geometry into dpoints? Or maybe into d first then recreate dpoints (seems messier and a bit more prone to error)
+
+```{r}
+
+## now I will drop the unnecessary variables
+## I also need to convert the class of the columns to allow the join so they are equivalent 
+## changing name of lat and long to match d to attempt rows_update
+new_coords <- tmp_geocode_arcgis %>% mutate(Latitude = as.character(lat), Longitude = long) %>% select (ID, Latitude, Longitude)
+
+
+
+
+```
+
+Okay, the first thing I am going to try here is merging the updated latitude and longitude into d
+
+Okay, so it looks like it was a character capitalization inconsistency. There are three records with "Race unspecified" (unspecified not capitalized) for RaceImputed. Their Race value is present though. I will need to update their raceimputed values with their correct race, and I guess I should also check for other variations of the capitalization on that variable. This is making me think I should just use clean_names() from janitor from the very beginning to avoid losing data / events this way. I think there was a similar issue with a force type, like asphyxiatied/restrained was inverted in one record or something like that. I am going to want to do the due dilligence of going through and checking by cleaning names. A bit annoying eh?
+
+Okay I've thought through it some and it won't really be the worst. I can use clean_names on d just after creating it I think, or maybe back when I import the CSV. Either way, clean the names, will have to fix some variable syntax throughout, but it will be more clean moving forward and I won't have to worry about variable convention causing missing data.
+
+It seems the convention is that Race is capitalized and unspecified is not, so why did these values come through? was I filtering on capitalization?
+
+Okay, so what happened is I was filtering on both 'Race' and 'RaceImputed' == "Race unspecified" which is correct given the assumption that 'RaceImputed' always trumps 'Race.' However, with these records it seems there is a value for 'Race' but not 'Race Unspecified.' This is not expected and probably should be reported to the FE team.
+
+Three other issues with the 'RaceImputed' potential values, from tmp_d:
+
+"HIspanic/Latino" (capitalized I) "european-American/white" (lower-case e) "" (blank race imputed value? space?)
+
+Although, these didn't show up in my data so they're probably older. I will just double check, and again probably needs to be reported to FE.
+
+IDs of typo races: european-American/White: 30050 HIspanic/Latino: 29042, 29042 " ": 31345, 30993, 30992, 30984, 30990 All of these are new events (\> 2020). Maybe there is data cleaning or something that they haven't done yet. Good news is, I don't have to worry about it affecting my data.
+
+Okay so all I need to do is change the value of RaceImputed for the three records which have a Race but no RaceImputed and I should be all good.
+
+```{r}
+
+## joining lat and long variables into tmp_d
+#tmp_d <- left_join(d, new_coords_df, by = join_by("Latitude" == "lat", "Longitude" == "long"))
+
+## mutating merged coordinates into original coordinate variables
+#tmp_d <- tmp_d %>% mutate(Latitude = lat, Longitude = long)
+
+d <- tmp_d
+
+d <- rows_update(d, new_coords)
+
+## updating rows with RaceImputed as unspecified but Race has a value
+
+tmp_race_check <- d %>% filter(RaceImputed == "Race unspecified") %>% select(ID, Race) %>% mutate(RaceImputed = Race) %>% select(!Race)
+
+d <- rows_update(d, tmp_race_check)
+
+rm(tmp_race_check)
+```
+
+Nailed it. I may want to clean up my comments and stuff later, but nailed it!
+
+Okay, that feels great. So from here there is something of a leap of faith required, I need to update d and have that be the new reference DF. I will have to decide if it is best to integrate all of this into the initial setup, or update from where I'm at. Some of this code might kind of require itself, we'll see. Exciting place to jump back in to.
+
+Okay, I went through and made all of the previous d and dpoint objects have the tmp prefix. I can probably have code clear all of those outputs at this point or something.
+
+```{r}
+tmp_list <- c("tmp_d", "tmp_d_all", "tmp_dpoints", "tmp_dpoints_joined", "tmp_dpoints_joined_bad", "tmp_dpoints_joined_bad_df", "tmp_dpoints_joined_bad_pip", "tmp_dpoints_joined_bad_sf", "tmp_dpoints_split", "tmp_geocode_arcgis")
+
+rm(list = tmp_list)
+
+
+```
+
+Okay cool. Now I am just left with the updated d DF. Back to basics here, I can convert D to an SF object, then create the pip objects. I may want to actually not remove the tmp files quite at this point, so I can compare the new dpoints object to the original just to double check nothing funky happened.
+
+```{r}
+
+dpoints <- d %>% st_as_sf(coords = c("Longitude", "Latitude"), crs = "NAD83", remove = FALSE)
+
+
+```
+
+Looks good on comparison. Bad coordinates are updated and good coordinates aren't changed. I am now going to create a state pip and check for NA values on GEOID.
+
+```{r}
+
+states_pip <- st_join(dpoints, states, st_within)
+tmp_states_pip_na <- states_pip %>% filter(is.na(GEOID))
+
+```
+
+Okay, that brought us from 28 bad records to one. Pretty good! Time to see what's up with that record, I wonder if it's that one in Washington at the restaurant that gives issues with coordinates for some reason.
+
+It is that record. I really don't know why those coordinates are funky. I've encountered this with this event several times now.
+
+The news article supporting the event is broken, and I can't find another online, so I don't know exactly what happened or where. I can either drop this event or manually update the coordinates to something that geocodes properly near the current coordinates. I could also try to figure out why these aren't mapping properly. For now I am going to just drop the event.
+
+```{r}
+
+d <- d %>% filter(ID != 9585)
+dpoints <- dpoints %>% filter(ID !=9585)
+rm(tmp_states_pip_na)
+
+```
+
+Okay!! Now I have all points with geodata, everyone in their correct place. I can now link with Census demographic data and start working on describing the data. Huge!
+
+If I don't want to think through what census variables to include yet I can just start with describing the events themselves without including Census / demographic data. Might be a good place to start anyways, so I can move from simple to more complex.
+
+# Data Description
+
+## Fatal Encounters
+
+First I want to get a count of how many events take place in each state. I think I will want to either drop MENA events, or include them in some other race category. There are only 30 and there isn't MENA data in Census currently it looks.
+
+```{r}
+
+states_count <- d %>% count(State, name = "fe_count")
+
+```
+
+Returning to this, this could be a good place to construct count by race variables for each state. I don't think that should be too tough.
+
+```{r}
+
+tmp_count_race <- d %>% count(State, RaceImputed)
+
+
+
+## consolidating each state with its count of FEs by race
+
+states_count_race <- tmp_count_race %>% 
+  pivot_wider(id_cols = State,
+              names_from = RaceImputed,
+              values_from = n,
+              values_fill = 0) %>% 
+  clean_names() %>% 
+  rename(black = african_american_black,
+         asian = asian_pacific_islander,
+         white = european_american_white,
+         hispanic = hispanic_latino,
+         native = native_american_alaskan,
+         mena = middle_eastern) %>% 
+  mutate(fe_count = states_count$fe_count) %>% 
+  mutate(asian_fe = asian / fe_count * 100,
+         black_fe = black / fe_count * 100,
+         hispanic_fe = hispanic / fe_count * 100,
+         native_fe = native / fe_count * 100,
+         white_fe = white / fe_count * 100) %>% 
+  mutate(pct_asian = states$pct_asian,
+         pct_blk = states$pct_blk,
+         pct_hispanic = states$pct_hispanic,
+         pct_native = states$pct_native,
+         pct_white = states$pct_white) %>% 
+  mutate(asian_dif = asian_fe - pct_asian,
+         black_dif = black_fe - pct_blk,
+         hispanic_dif = hispanic_fe - pct_hispanic,
+         native_dif = native_fe - pct_native,
+         white_dif = white_fe - pct_white)
+
+
+
+#rm(tmp_count_race)
+
+#testing_states_count_race <- states_count_race %>% mutate(high_dif = pmax(asian_dif, black_dif, #hispanic_dif, native_dif, white_dif), high_race = case_when())
+```
+
+
+I think I'm on to something here. A home grown (sort of) solution!
+Okay so this cleanly got me the max dif values for each row, and I can use max.col to get the column that each max is in (so I can get the racial group), but I think I will run into the same problem as before, capturing the column name for min values, since for some reason min.col doesn't exist. I think I need to just try that solution thats on stack overflow...
+```{r}
+
+difs <- c("asian_dif", "black_dif", "hispanic_dif", "native_dif", "white_dif")
+df_difs <- c("states_count_race$asian_dif", "states_count_race$white_dif")
+
+tmp_difs <- states_count_race %>% select(all_of(difs)) %>% pmap(pmax) %>% as.numeric()
+
+
+
+```
+
+almost had it here. same issue with names. trying a different package that might work better
+
+```{r}
+
+
+## ALERT! the max_race variable here seemingly does nothing. Might have been starting and stopping trying a different way. Leaving it here as a backup, but yeah.
+states_count_race_id <- states_count_race %>% group_by(state) %>%  summarise(max_dif = pmax(asian_dif, black_dif, hispanic_dif, native_dif, white_dif),
+                                                                             min_dif = pmin(asian_dif, black_dif, hispanic_dif, native_dif, white_dif),
+                                                                             max_race = pmax(asian_dif, white_dif))
+
+
+```
+
+Trying something different, this is from the same stack overflow post below about 'for each row return the column name' etc.
+
+Wait is this it? This was so easy...
+
+```{r}
+
+tmp_test <- states_count_race %>% select(asian_dif, black_dif, hispanic_dif, native_dif, white_dif)
+
+tmp_test <- tmp_test %>% mutate(max_race = colnames(tmp_test)[apply(tmp_test, 1, which.max)], min_race = colnames(tmp_test)[apply(tmp_test, 1, which.min)])
+
+tmp_test <- tmp_test %>% mutate(max_dif = states_count_race_id$max_dif, min_dif = states_count_race_id$min_dif, state = states_count_race_id$state)
+
+states_dif <- tmp_test %>% select(state, max_race, max_dif, min_race, min_dif)
+```
+
+
+OKAYYYYYY! I got the column names which contain the highest and lowerst values for each racial group. I have code above for grabbing the max, and I am pretty sure I can construct a min grab from that as well pretty easily. Good progress good progress. Glad I took my medication lol. Gotta walk Celeste now but maybe I'll return to think afterword.
+
+Okay so as it is the way I am pulling in the maxes and mins is a little janky because it's just from another DF, but is that so different from joining? Probably. I want to move forward some so I'm good with it for now. I can make it pretty later.
+
+
+COOOL! So now I have a DF where I can easily see the most over and under represented groups, and by what percent they are over or underrepresented. Now I can actually just look at this and see what my initial findings are. Exciting!
+
+
+
+
+max.col(states_count_race_id)
+If this doesn't end up working, I found another stackoverflow post that also seems like it will work (seems more in line with what I'm doing than the last one):
+https://stackoverflow.com/questions/17735859/for-each-row-return-the-column-name-of-the-largest-value
+
+starting at "One solution could be to reshape the date from wide to long"
+This one also seems to be more toward the type of literacy I want, moving from long to wide etc. Maybe I'll just try it?
+
+
+
+yeah that wasn't it. idk. I have spent a lot of time on this. I think I need to piecemeal something together and move on. I can manually join or something and generate the names of the groups. This has been a time sink and I am feeling frustrated. As I wrote below even though that's an older comment lol. I know I can do this. It's a massive stall for now though. break time.
+
+This is getting hard and a bit frustrating. I think I made some progress? Sorta hard to tell. This data wrangling stuff can be a bit of a time sink! I found a stackoverflow post though that seems like it will help if I follow it. Will check that out later with more capacity. It's open in chrome and also here:
+
+https://stackoverflow.com/questions/32978458/dplyr-mutate-rowwise-max-of-range-of-columns
+"the first is more elegant"
+
+
+*** copied from below for easier guidance***:
+
+I want to know which racial group is most over/under represented in fatal encounters in each state (one racial group per state), and what that value is.
+Maybe what might help is to construct two variables:
+A high_dif one which checks if the difference is greater than any other difference in that state
+A low_dif one which checks if the difference is less than any other difference in that state.
+In an attempt to not bork myself I am going to try to mutate this directly onto the states_count_race df
+
+
+Okay, now I have a variable for each racial group and the count per state of those racial groups, as well as the total for each state.
+
+Now I will briefly visualize the count of events by state The dashed line in the density plot is the mean
+
+```{r}
+
+ggplot(states_count, aes(x = State, y = fe_count))+
+  geom_col()
+
+ggplot(states_count, aes(x = fe_count))+
+  geom_density()+
+  geom_vline(aes(xintercept = mean(fe_count)), linetype = "dashed")
+
+```
+
+This indicates that there are a few outlier states which contain many fatal encounters. It will be helpful to summarize the count by state data.
+
+```{r}
+
+states_summary <- states_count %>% summarise(states_mean = mean(fe_count), states_median = median(fe_count), states_iqr = IQR(fe_count), states_sd = sd(fe_count), states_min = min(fe_count), states_max = max(fe_count))
+
+```
+
+
+ALERT! this is national-level.
+```{r}
+## What percent of FEs does each racial group represent across the US?
+
+race_data <- tibble(black = sum(states_count_race$black),
+                    asian = sum(states_count_race$asian),
+                    white = sum(states_count_race$white),
+                    hispanic = sum(states_count_race$hispanic),
+                    native = sum(states_count_race$native),
+                    mena = sum(states_count_race$mena))
+
+race_data <- race_data %>% mutate(fe_count = sum(race_data))
+
+race_data <- race_data %>% mutate(pct_black = black / fe_count * 100,
+                                  pct_asian = asian / fe_count * 100,
+                                  pct_white = white / fe_count * 100,
+                                  pct_hispanic = hispanic / fe_count * 100,
+                                  pct_native = native / fe_count * 100,
+                                  pct_mena = mena / fe_count * 100)
+
+## okay so race_data is good on denominators 
+## mena getting half dropped here, where and when do we full drop?
+us_compare <- tibble(us_pop = sum(states$Hispanic, states$White, states$Black, states$Native, states$Asian),
+                     black_fe = race_data$pct_black,
+                     asian_fe = race_data$pct_asian,
+                     white_fe = race_data$pct_white,
+                     hispanic_fe = race_data$pct_hispanic,
+                     native_fe = race_data$pct_native,
+                     mena_fe = race_data$pct_mena,
+                     black_pop = sum(states$Black),
+                     asian_pop = sum(states$Asian),
+                     white_pop = sum(states$White),
+                     hispanic_pop = sum(states$Hispanic),
+                     native_pop = sum(states$Native),
+                     black_pct = black_pop / us_pop * 100,
+                     asian_pct = asian_pop / us_pop * 100,
+                     white_pct = white_pop / us_pop * 100,
+                     hispanic_pct = hispanic_pop / us_pop * 100,
+                     native_pct = native_pop / us_pop * 100,
+                     black_dif = black_fe - black_pct,
+                     asian_dif = asian_fe - asian_pct,
+                     white_dif = white_fe - white_pct,
+                     hispanic_dif = hispanic_fe - hispanic_pct,
+                     native_dif = native_fe - native_pct)
+
+us_compare <- us_compare %>% select(sort(names(.)))
+```
+
+```{r}
+
+## constructing summary values for a single-row tibble
+
+tmp_pops <- sum(states$Hispanic, states$White, states$Black, states$Native, states$Asian)
+
+## this shows me that the state level data include the total population of the state, so including mulitracial people. This is because of the summary value I chose. I think I can safely just construct my own summary values. May even be able to do this when pulling Census data. This is okay for now though, as at least I know my denominator will be right.
+
+
+tmp_pops2 <- sum(states$summary_value)
+tmp_pops3 <- sum(us_compare$asian_pop, us_compare$black_pop, us_compare$hispanic_pop, us_compare$native_pop, us_compare$white_pop)
+
+```
+
+So now that us_compare has the summary values I'm interested in, I can make comparisons of rates of FEs by race of victim across the US and also assess the disproportionality at the state level. From there I can move on to other levels of aggregation.
+
+First I will need to update my DFs and SFs with the appropriate summary values I wonder if there is a summary variable in the Census data already that represents the totals I'm using here so I don't have to build it from scratch?
+
+Okay, I found a new summary variable and built a new SF 'states_new.' Now I want to see if the summary variables match the ones I manually built. If they do, I can just use this as the new states SF and use the new summary variable P1_002N for all future work.
+
+```{r}
+
+#sum(states_new$summary_value)
+#sum(us_compare$asian_pop, us_compare$black_pop, us_compare$hispanic_pop, us_compare$native_pop, #us_compare$white_pop)
+
+```
+
+Okay they are not equivilent. Another easier way to check this is to sum the counts for each race for a given state, then compare to summary value (on states_new). In New Mexico this shows a gap of 400k. So either my summary variable is incorrect (seems unlikely?) or my race variables aren't correct and are capturing two or more or something. I knew that I'd have to wrestle with this eventually. All good. Immediate next step is to double check more closely what race variables I'm actually feeding into racecats, and compare them to how the Census describes them.
+
+What would be helpful now? I have counts by race by state, as well as totals by state. So some ideas:
+
+(1) \[done\] What percent of fatal encounters does each racial group represent across the US?
+
+```{r}
+race_data %>% select(pct_black, pct_asian, pct_white, pct_hispanic, pct_native, pct_mena)
+```
+
+How does this compare to the population distribution of each racial group across the US? (checking for disproportionality)
+
+```{r}
+us_compare %>% select(black_dif, asian_dif, white_dif, hispanic_dif, native_dif)
+```
+
+The above numbers represent the over or underrepresentation of each racial group in police killings relative to their representation in the total population in the US.
+
+Disproportionality is strongest among Black people, with Whites second (in the other direction, underrepresentation)
+
+(1.5) I should sum each racial group in each state in the 'states' SF object and see what the total is. Does that reflect the summary value, and does that reflect the total in 'us?' I need to make sure my denominators are the same.
+
+```{r}
+
+sum(states$Hispanic, states$White, states$Black, states$Native, states$Asian)
+# right, so this is missing 16 million people as compared to the us sf object, a lot.
+
+sum(states$summary_value)
+# this however, shows the same value as 'us'. Is this a puerto rico difference or a two or more races difference or both?
+
+## Puerto Rico is 3.2 million, so maybe it's both.
+## I think I need to pull in the total population of two or more races and see if that's what's up.
+```
+
+```{r}
+
+## checking population size of two or more races, hoping for around 12 million
+tmp_racecats <- c(Hispanic = "P2_002N", White = "P2_005N", Black = "P2_006N", Native = "P2_007N", Asian  = "P2_008N", Mixed = "P2_011N")
+
+tmp_states_mixed_pr <- get_decennial(year = 2020,
+                             geography = "state",
+                             geometry = TRUE,
+                             sumfile = "pl",
+                             variables = tmp_racecats,
+                             cache_table = TRUE,
+                             summary_var = "P2_001N",
+                             output = "wide",
+                        keep_geo_vars = TRUE)
+
+tmp_states_mixed <- tmp_states_mixed_pr %>% filter(GEOID != "72")
+
+```
+
+```{r}
+# how do the denominators look now?
+sum(tmp_states_mixed$Hispanic, tmp_states_mixed$White, tmp_states_mixed$Black, tmp_states_mixed$Native, tmp_states_mixed$Asian, tmp_states_mixed$Mixed)
+## that brings it to 329 million, which might mean that the 2.6 million people in Puerto Rico fit nicely
+
+sum(tmp_states_mixed_pr$Hispanic, tmp_states_mixed_pr$White, tmp_states_mixed_pr$Black, tmp_states_mixed_pr$Native, tmp_states_mixed_pr$Asian, tmp_states_mixed_pr$Mixed)
+
+sum(tmp_states_mixed$summary_value)
+sum(tmp_states_mixed_pr$summary_value)
+
+## okay so tmp_states_mixed is really close. it's correct on the summary values. What if I just added the population of Puerto Rico to the sum of the race values from mixed?
+
+sum(tmp_states_mixed$Hispanic, tmp_states_mixed$White, tmp_states_mixed$Black, tmp_states_mixed$Native, tmp_states_mixed$Asian, tmp_states_mixed$Mixed) + 3285874
+
+# That brings the total within 2600 people. pretty good all things considered, not perfect though.
+# the mixed population in Puerto Rico is 2340, which would bring it to within 260, which is basically perfect. I think I can figure out specifically what is going on here.
+```
+
+us pop from us df = 331449281
+
+Looking at all this above, I wonder if what I need is just to constrct my own percents and summary values, instead of referring to the us SF object. Mostly because I don't actually know if that is 50 states, 51, including Puerto Rico, etc.
+
+\*\*\* Going to move forward with this. Here is my logic: The FE data assumes people are strictly Black, White, Asian, Hispanic (non-white), or Indigenous (as well as 30 MENA which I will probably drop since they are 1/4 of 01%).
+
+I am going to go and comment out the 'us' SF object, as well as the summary values that I was pulling from it and construct summary values from 'states'
+
+My states sf object follows this logic, it includes only single race people of these same demographics (MENA also not in these census data which is another point for dropping it)
+
+This means that my summary value for across the US should come from summing the populations of each individual state in the states SF object.
+
+
+
+
+(2) What percent of fatal encounters does each racial group represent in each state? How does this compare to the population distribution of each racial group in each state? (checking for disproportionality)
+
+(I'm here now). I will need the list of objects trick here again.
+The core part of that is the map() or map2() function. What I actually want is:
+A dataframe that has a list with each state, on that should be:
+rows: states
+columns: percent of each racial group (pct_black, pct_white etc.), percent of the total fe count each racial group represents (black_fe, white_fe etc), the diff.
+
+Okay! This is now in the states_count_race DF. There are columns for asian_dif, hispanic_dif etc. which is the percentage of fatal encounters in that state that each racial group represents minus the percentage of the population of that state that is that race. Lots of interesting stuff here. 
+
+Nope, something wrong, looks like on West Virginia it shows white_dif as 67 percentage points but 89% of WV is white and 89$ of FE there are also white. So probably something wrong with the dif variable. I don't think it's pulling wrong fe pct or pop pct.
+I think it's because I'm pulling the race percent variables from the states df. I will just mutate them on to states_count_race and then compile the differences
+
+Okay, the problem wasn't because I was pulling from another DF, which makes sense because I did that for us_compare. The problem is (I'm pretty sure) a grouping / sorting thing. I think the two DFs are sorted by different values and so the variables aren't mapping properly. This is a reason why joining instead of mutating manually could be good. But joining was annoying.
+
+Okay, so I checked and neither states nor states_count_race are grouped (can check by just printing the DF, can group and print to see it says groups: (variable) when it is grouped)
+
+So that means what's going on is probably one of the following:
+data type mismatch (character, numeric, numeric with limits, etc.)
+object type mismatch (matching an SF object to a DF object)
+row ordering mismatch (one object sorted by state name, other seemingly random)
+
+Acknowledging that the right thing to do here is probably to left_join so I have more control, I want to know what's up here, so I want to try to figure this out the way I've started.
+Next steps:
+1. Make a DF of the states SF object, drop geometry, then try again
+2. After above, also check for sorting.
+3. Win, probably.
+
+Trying 1. above
+First, looking at this now the problem seems to be at least for WV with the percent white variable. (looking at states_count_race). This is showing me that WV is 21% white. That seems unlikely.
+Yeah so the values are wrong. I'm pretty sure this has to do with how the DFs are arranged. Gonna try arranging states and trying again. Just wanna say again, the proper approach here (and what I will ultimately want to do to avoid mistakes) is a proper join.
+
+***********What I am going to do now is go up to states and arrange it. If things get borked, that's what happened.
+Cool, that fixed it! Interesting that the arrangement matters on an ungrouped DF. Now I know!
+So now I think states_count_race should have the disproportionality for all racial groups I'm interested in relative to their state-level populations.
+
+It does. Some interesting info under findings from initial glances. Next step might be to visualize and describe this data a bit more cleanly.
+
+
+### FE Visualizations
+
+Just trying on visualiztion, black difference by state
+```{r}
+
+ggplot(states_count_race, aes(x = black_dif))+
+  geom_histogram()
+
+
+```
+
+
+I think part of why creating a visualization is hard is I don't know exactly what I'm looking for. So a question: what am I looking for, and from that how can I use ggplot to show me that information?
+
+(1) I want to know which racial group is most over/under represented in fatal encounters in each state (one racial group per state), and what that value is.
+Maybe what might help is to construct two variables:
+A high_dif one which checks if the difference is greater than any other difference in that state
+A low_dif one which checks if the difference is less than any other difference in that state.
+In an attempt to not bork myself I am going to try to mutate this directly onto the states_count_race df
+
+(2) I want to know in which state each racial group experiences the most over/under representation (one state per racial group).
+
+
+
+
+```{r}
+
+#map(states_split[state_letters], sum(states_split[]))
+
+# close but no cigar here. gonna tinker around with a different approach
+#states_split[[Black]][]
+
+
+## okay cool that I figured this out with an anonymous function but I literally already had race percents lol
+#map(states$Black, ~.x / states$summary_value * 100)
+  
+
+  
+  
+  #select(STUSPS, Hispanic, White, Black, Native, Asian) %>% map()
+```
+
+
+
+## Important probably
+
+All this mess is making me think from a process perspective, it might make the most sense to start at the smallest level of aggregation I'm going to look at and work up. Because I started nationally, then am building state level, but the state level sums to the national, as the counties will sum to the state and then to national, as tracts - counties - states - national etc. The data is nested. So I might be duplicating work by starting at the largest level of aggregation instead of the other way around. The small to large approach would also prove to be a consistency check, though it would the other way around when it's all said and done. I'm going to finish what I'm doing with the state level because it's almost done but yeah that's something to think about. Maybe I just go down to block group or block level next.
+
+I think I can do what I'm trying to do below by just adding like one column to states_count_race lol.
+```{r}
+
+#states_compare <- states %>% as_tibble() %>% select(STUSPS, pct_hispanic, pct_white, pct_blk, #pct_native, pct_asian) %>% mutate(hispanic_fe = states_count_race$his)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+(3) How does the racial distribution of FEs in each state compare to the distribution nationally?
+
+(4) Just noting, I think I can just get rid of the states_count df now that I have states_count_race, or just rename the race one to states_count
+
+(5) Once I've exhausted what is interesting or feasbile with the fatal encounter data alone I can include Census data for a whole new spin on things
+
+(6) \[done\] Why do I have RaceUnspecified values? I thought I filtered those out? Want to figure that out sooner than later so as to not be up a creek like last time.
+
+-   Gonna just take a quick look at that now.
+
+(7) what to do with MENA? drop? no Census race data and small N. need to think through a bit
+
+
+# Findings
+
+On the state-level, we see a general trend of Black people overrepresented and white people underrepresented, which is expected. There are some other interesting points, for example, in South Dakota, where Native people make up 8% of the population, they represent nearly half of all people killed by police (15 of 33). Making for a 37% overrepresentation. This is among the most severe disproportionalities for any racial group in either direction.
