@@ -292,7 +292,7 @@ From here I will export this dataframe as a CSV so I have a repaired copy of the
 
 ```{r}
 
-write.csv(tmp_d, file = 'FE-clean.csv')
+write.csv(tmp_d, file = 'FE-clean.csv', row.names = FALSE)
 
 
 ```
