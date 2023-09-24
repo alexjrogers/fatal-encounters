@@ -98,6 +98,31 @@ tmp_d <- tmp_d %>% filter(grepl(paste(types, collapse = "|"), ForceType))
 
 ```
 
+Another more race task, RaceImputed is used by FE as the Race variable, however there are three records with a RaceImputed value of "Race unspecified" which do have a "Race" variable value (RaceImputed should be a combined column with both non-imputed and imputed race values, per FE readme). I am going to use the Race variable for those records to populate the RaceImputed value. This should be reported to Fatal Encounters.
+
+```{r}
+
+tmp_race_check <- tmp_d %>% filter(RaceImputed == "Race unspecified") %>% select(ID, Race, RaceImputed) %>% mutate(RaceImputed = Race) %>% select(!Race)
+
+tmp_d <- rows_update(tmp_d, tmp_race_check)
+```
+
+The IDs of the bad race records are:
+25119
+17732
+3243
+
+The final data cleaning task related to the race variable, there isn't an equivalent racial category in the redistricting file. It may be feasible to capture that category via write-ins, but not completely reliable. For the moment I will drop the events where the victim was reported as "Middle Eastern" from the FE data.
+There are 30 events in the FE data where the victim's race is recorded as Middle Eastern.
+
+```{r}
+
+tmp_d <- tmp_d %>% filter(RaceImputed != "Middle Eastern")
+
+
+```
+
+
 Now that I have the DF filtered by years, with NA race values excluded, and by relevant force type, I create my sf object by converting the coordinates to points. I know there are some bad geodata in this dataset, so the next step is to get that cleaned up.
 
 # repairing bad geodata, step one
@@ -196,4 +221,79 @@ tmp_dpoints_joined <- map2(tmp_dpoints_split[state_letters], states_split, st_jo
 This join attempts to place each event within its corresponding state and generate the spatial and demographic information for that state. FE events with incorrect state classifications cannot be placed within the Census boundaries that the Census object expects, so they will generate NA values for all Census variables.
 
 With this done, we can filter events by those which have generated an NA value for GEOID (the Census geographic identifier), to identify the events with coordinate data in the FE dataset.
+
+```{r}
+
+## using map() to apply a filter function across the dataframes in the list, retaining only events with bad geodata
+tmp_dpoints_joined_bad <- map(tmp_dpoints_joined, ~filter(.x, is.na(GEOID)))
+
+## dropping states without bad records
+tmp_dpoints_joined_bad <- tmp_dpoints_joined_bad %>% discard(~nrow(.) == 0)
+
+```
+
+This new list of objects includes only states that have bad geodata, and only the events in those states with bad geodata.
+
+Next we need to get proper coordinate data for these events. This takes a few steps:
+
+(1) I will convert this list of SF objects into a single dataframe, then remove the geometry column (to prevent conflicts when converting back to an SF object later on).
+(2) I will use the ArcGIS geocoder to generate the correct coordinate data from the addresses provided by fatal encounters.
+(3) Finally I can convert the new coordinate data to point data, and integrate these repaired events back into the FE data.
+
+First we create a dataframe from this list of SF obects.
+
+```{r}
+
+## creating DF, dropping census variables, dropping geometry
+tmp_dpoints_joined_bad_df <- list_rbind(tmp_dpoints_joined_bad) %>% select_if(~ !any(is.na(.))) %>% select(!geometry)
+
+
+```
+
+Next we use the ArcGIS API to generate coordinates from the addresses:
+
+```{r}
+
+tmp_geocode_arcgis <- geocode(tmp_dpoints_joined_bad_df, address = Address, method = "arcgis")
+
+
+```
+I manually checked the coordinate data via Google maps. For a larger volume of coordinates a more sophisticated (and automated) way to check would be helpful.
+
+Next I will prepare the dataframe with the correct coordinates to be merged into the FE data. tidygeocoder names the coordinate variables lat and long, but sf expects Latitude and Longitude, so I'll rename the tidygeocoder variables while removing the bad coordinate data:
+
+```{r}
+
+tmp_geocode_arcgis <- tmp_geocode_arcgis %>% mutate(Latitude = as.character(lat), Longitude = long) %>% select(ID, Latitude, Longitude)
+
+
+```
+
+Finally I can update the FE dataframe with the repaired coordinates:
+
+```{r}
+
+tmp_d <- rows_update(tmp_d, tmp_geocode_arcgis)
+
+
+```
+There is one record that could not be properly geocoded. Even when I manually input the address and try to convert it to coordinates using various GIS APIs, it just doesn't take. I am going to drop that event from analysis. I could grab coordinates from a business or intersection nearby, I'm not completely sure if that is a better or worse solution. Likely it's a better solution. It's ID 9585
+
+```{r}
+
+#dropping troublesome event with bad address data
+tmp_d <- tmp_d %>% filter(ID != 9585)
+
+
+```
+
+
+From here I will export this dataframe as a CSV so I have a repaired copy of the data to work from more efficiently moving forward.
+
+```{r}
+
+write.csv(tmp_d, file = 'FE-clean.csv')
+
+
+```
 
